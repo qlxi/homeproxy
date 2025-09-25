@@ -1,48 +1,108 @@
-name: Build homeproxy for OpenWrt (ipq60xx/generic)
+name: Build Homeproxy for OpenWrt
 
 on:
   workflow_dispatch:
+    inputs:
+      target:
+        description: 'Target architecture'
+        required: true
+        default: 'ipq60xx'
+      subtarget:
+        description: 'Subtarget'
+        required: true
+        default: 'generic'
   push:
-    branches:
-      - main
+    branches: [ main, master ]
+  schedule:
+    - cron: '0 2 * * 0' # Воскресенье в 2:00
+
+env:
+  IMMORTALWRT_BRANCH: openwrt-23.05
+  TARGET: ipq60xx
+  SUBTARGET: generic
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
 
-    env:
-      TARGET: ipq60xx/generic
-      ARCH: aarch64_cortex-a53_neon-vfpv4
+    strategy:
+      matrix:
+        package: [homeproxy, luci-app-homeproxy, sing-box]
 
     steps:
-      - name: Checkout OpenWrt source (LiBwrt/openwrt-6.x)
-        uses: actions/checkout@v4
-        with:
-          repository: LiBwrt/openwrt-6.x
-          ref: main
+    - name: Checkout repository
+      uses: actions/checkout@v4
 
-      - name: Add homeproxy package
-        run: |
-          git clone https://github.com/immortalwrt/homeproxy package/homeproxy
+    - name: Setup environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential ccache ecj fastjar file g++ gawk \
+          gettext git libelf-dev libncurses5-dev libncursesw5-dev \
+          libssl-dev python3 python3-distutils python3-setuptools \
+          rsync subversion swig time unzip wget xsltproc zlib1g-dev
 
-      - name: Update feeds
-        run: |
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
+    - name: Cache ImmortalWrt source
+      uses: actions/cache@v3
+      with:
+        path: immortalwrt
+        key: immortalwrt-${{ env.IMMORTALWRT_BRANCH }}-${{ hashFiles('**/version.txt') }}
+        restore-keys: |
+          immortalwrt-${{ env.IMMORTALWRT_BRANCH }}-
 
-      - name: Configure target
-        run: |
-          # Указываем таргет ipq60xx/generic
-          echo "CONFIG_TARGET_ipq60xx=y" >> .config
-          echo "CONFIG_TARGET_ipq60xx_generic=y" >> .config
-          make defconfig
+    - name: Clone ImmortalWrt
+      if: steps.cache.outputs.cache-hit != 'true'
+      run: |
+        git clone https://github.com/immortalwrt/immortalwrt.git --branch ${{ env.IMMORTALWRT_BRANCH }} --depth 1
 
-      - name: Build homeproxy package
-        run: |
-          make package/homeproxy/compile V=s -j$(nproc)
+    - name: Update feeds
+      run: |
+        cd immortalwrt
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
 
-      - name: Upload IPK artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: homeproxy-ipk-${{ env.TARGET }}
-          path: bin/packages/${{ env.ARCH }}/base/homeproxy*.ipk
+    - name: Cache build system
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.ccache
+          immortalwrt/dl
+          immortalwrt/staging_dir
+        key: ${{ runner.os }}-build-${{ env.TARGET }}-${{ env.SUBTARGET }}-${{ hashFiles('immortalwrt/.config') }}
+        restore-keys: |
+          ${{ runner.os }}-build-${{ env.TARGET }}-${{ env.SUBTARGET }}-
+
+    - name: Configure for target
+      run: |
+        cd immortalwrt
+        cat > .config << EOF
+CONFIG_TARGET_${{ env.TARGET }}=y
+CONFIG_TARGET_${{ env.TARGET }}_${{ env.SUBTARGET }}=y
+CONFIG_TARGET_${{ env.TARGET }}_${{ env.SUBTARGET }}_DEVICE_generic=y
+CONFIG_PACKAGE_${{ matrix.package }}=y
+EOF
+        make defconfig
+
+    - name: Build package
+      run: |
+        cd immortalwrt
+        make package/${{ matrix.package }}/compile -j$(nproc) V=sc
+
+    - name: Collect packages
+      run: |
+        mkdir -p artifacts
+        find immortalwrt/bin -name "*${{ matrix.package }}*.ipk" -exec cp {} artifacts/ \;
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.package }}-${{ env.TARGET }}
+        path: artifacts/*
+        retention-days: 30
+
+    - name: Create release on tag
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v1
+      with:
+        files: artifacts/*.ipk
