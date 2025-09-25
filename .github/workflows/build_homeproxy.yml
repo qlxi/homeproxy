@@ -1,4 +1,4 @@
-name: Build homeproxy with LiBwrt/openwrt-6.x (ipq60xx/generic)
+name: Build homeproxy for OpenWrt (ipq60xx/generic)
 
 on:
   workflow_dispatch:
@@ -12,17 +12,16 @@ jobs:
 
     env:
       TARGET: ipq60xx/generic
+      ARCH: aarch64_cortex-a53_neon-vfpv4
 
     steps:
-      - name: Checkout LiBwrt/openwrt-6.x
-        uses: actions/checkout@v3
+      - name: Checkout OpenWrt source (LiBwrt/openwrt-6.x)
+        uses: actions/checkout@v4
         with:
           repository: LiBwrt/openwrt-6.x
-          # Можно указать branch, если нужно
           ref: main
 
-      - name: Checkout homeproxy package
-        # Клонируем пакет homeproxy в папку package/homeproxy
+      - name: Add homeproxy package
         run: |
           git clone https://github.com/immortalwrt/homeproxy package/homeproxy
 
@@ -33,18 +32,17 @@ jobs:
 
       - name: Configure target
         run: |
-          # Устанавливаем нужные опции в .config, чтобы включить ipq60xx generic
-          # В зависимости от структуры config: может быть TARGET_ipq60xx=y и TARGET_ipq60xx_generic=y
-          ./scripts/feeds update -a
+          # Указываем таргет ipq60xx/generic
+          echo "CONFIG_TARGET_ipq60xx=y" >> .config
+          echo "CONFIG_TARGET_ipq60xx_generic=y" >> .config
           make defconfig
-          # Опционально: можно использовать scripts/config или `yes '' | make menuconfig` с автоответами
 
       - name: Build homeproxy package
         run: |
           make package/homeproxy/compile V=s -j$(nproc)
 
-      - name: Gather artifact
-        uses: actions/upload-artifact@v3
+      - name: Upload IPK artifact
+        uses: actions/upload-artifact@v4
         with:
           name: homeproxy-ipk-${{ env.TARGET }}
-          path: bin/packages/${{ env.TARGET##*/ }}/base/homeproxy*.ipk
+          path: bin/packages/${{ env.ARCH }}/base/homeproxy*.ipk
