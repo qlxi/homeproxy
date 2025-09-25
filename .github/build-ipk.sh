@@ -1,94 +1,86 @@
 #!/bin/bash
-# SPDX-License-Identifier: GPL-2.0-only
-#
-# Copyright (C) 2023 Tianling Shen <cnsztl@immortalwrt.org>
+set -e
 
-set -o errexit
-set -o pipefail
+echo "=== Building Homeproxy for OpenWrt ==="
 
-export PKG_SOURCE_DATE_EPOCH="$(date "+%s")"
+# Параметры сборки
+TARGET="ipq60xx"
+SUBTARGET="generic"
+ARCH="aarch64_cortex-a53"
+OPENWRT_VERSION="23.05"
+IMMORTALWRT_REPO="https://github.com/immortalwrt/immortalwrt"
+IMMORTALWRT_BRANCH="openwrt-23.05"
 
-BASE_DIR="$(cd "$(dirname $0)"; pwd)"
-PKG_DIR="$BASE_DIR/.."
+# Установка зависимостей
+echo "Installing dependencies..."
+sudo apt-get update
+sudo apt-get install -y \
+    build-essential ccache ecj fastjar file g++ gawk \
+    gettext git libelf-dev libncurses5-dev libncursesw5-dev \
+    libssl-dev python3 python3-distutils python3-setuptools \
+    rsync subversion swig time unzip wget xsltproc zlib1g-dev fakeroot
 
-function get_mk_value() {
-	awk -F "$1:=" '{print $2}' "$PKG_DIR/Makefile" | xargs
-}
-
-PKG_NAME="$(get_mk_value "PKG_NAME")"
-if [ "$RELEASE_TYPE" == "release" ]; then
-	PKG_VERSION="$(get_mk_value "PKG_VERSION")"
+# Клонирование ImmortalWrt
+echo "Cloning ImmortalWrt..."
+if [ ! -d "immortalwrt" ]; then
+    git clone --depth 1 --branch "$IMMORTALWRT_BRANCH" "$IMMORTALWRT_REPO" immortalwrt
 else
-	PKG_VERSION="dev-$PKG_SOURCE_DATE_EPOCH-$(git rev-parse --short HEAD)"
+    echo "ImmortalWrt already exists, updating..."
+    cd immortalwrt
+    git pull
+    cd ..
 fi
 
-TEMP_DIR="$(mktemp -d -p $BASE_DIR)"
-TEMP_PKG_DIR="$TEMP_DIR/$PKG_NAME"
-mkdir -p "$TEMP_PKG_DIR/CONTROL/"
-mkdir -p "$TEMP_PKG_DIR/lib/upgrade/keep.d/"
-mkdir -p "$TEMP_PKG_DIR/usr/lib/lua/luci/i18n/"
-mkdir -p "$TEMP_PKG_DIR/www/"
+# Клонирование homeproxy package
+echo "Setting up homeproxy package..."
+mkdir -p immortalwrt/package/custom
+cd immortalwrt/package/custom
 
-cp -fpR "$PKG_DIR/htdocs"/* "$TEMP_PKG_DIR/www/"
-cp -fpR "$PKG_DIR/root"/* "$TEMP_PKG_DIR/"
+if [ ! -d "homeproxy" ]; then
+    git clone https://github.com/immortalwrt/homeproxy.git
+else
+    echo "Homeproxy package exists, updating..."
+    cd homeproxy
+    git pull
+    cd ..
+fi
 
-echo -e "/etc/config/homeproxy" > "$TEMP_PKG_DIR/CONTROL/conffiles"
-cat > "$TEMP_PKG_DIR/lib/upgrade/keep.d/$PKG_NAME" <<-EOF
-/etc/homeproxy/certs/
-/etc/homeproxy/ruleset/
-/etc/homeproxy/resources/direct_list.txt
-/etc/homeproxy/resources/proxy_list.txt
+cd ../../..
+
+# Настройка конфигурации
+echo "Configuring build..."
+cd immortalwrt
+
+# Базовая конфигурация
+cat > .config << EOF
+CONFIG_TARGET_${TARGET}=y
+CONFIG_TARGET_${TARGET}_${SUBTARGET}=y
+CONFIG_TARGET_${TARGET}_${SUBTARGET}_DEVICE_generic=y
+CONFIG_PACKAGE_homeproxy=y
+CONFIG_PACKAGE_luci-app-homeproxy=y
+CONFIG_PACKAGE_sing-box=y
 EOF
 
-cat > "$TEMP_PKG_DIR/CONTROL/control" <<-EOF
-	Package: $PKG_NAME
-	Version: $PKG_VERSION
-	Depends: libc, sing-box, firewall4, kmod-nft-tproxy, ucode-mod-digest
-	Source: https://github.com/immortalwrt/homeproxy
-	SourceName: $PKG_NAME
-	Section: luci
-	SourceDateEpoch: $PKG_SOURCE_DATE_EPOCH
-	Maintainer: Tianling Shen <cnsztl@immortalwrt.org>
-	Architecture: all
-	Installed-Size: TO-BE-FILLED-BY-IPKG-BUILD
-	Description:  The modern ImmortalWrt proxy platform for ARM64/AMD64
-EOF
+# Обновление feeds
+echo "Updating feeds..."
+./scripts/feeds update -a
+./scripts/feeds install -a
 
-git clone --filter=blob:none --no-checkout "https://github.com/openwrt/luci.git" "po2lmo"
-pushd "po2lmo"
-git config core.sparseCheckout true
-echo "modules/luci-base/src" >> ".git/info/sparse-checkout"
-git checkout
-cd "modules/luci-base/src"
-make po2lmo
-./po2lmo "$PKG_DIR/po/zh_Hans/homeproxy.po" "$TEMP_PKG_DIR/usr/lib/lua/luci/i18n/homeproxy.zh-cn.lmo"
-popd
-rm -rf "po2lmo"
+# Сборка пакета
+echo "Building homeproxy package..."
+make package/homeproxy/compile -j$(ncp u) V=s
 
-echo -e '#!/bin/sh
-[ "${IPKG_NO_SCRIPT}" = "1" ] && exit 0
-[ -s ${IPKG_INSTROOT}/lib/functions.sh ] || exit 0
-. ${IPKG_INSTROOT}/lib/functions.sh
-default_postinst $0 $@' > "$TEMP_PKG_DIR/CONTROL/postinst"
-chmod 0755 "$TEMP_PKG_DIR/CONTROL/postinst"
+# Поиск собранного пакета
+IPK_FILE=$(find bin/packages/${ARCH}/base -name "homeproxy*.ipk" | head -1)
 
-echo -e "[ -n "\${IPKG_INSTROOT}" ] || {
-	(. /etc/uci-defaults/$PKG_NAME) && rm -f /etc/uci-defaults/$PKG_NAME
-	rm -f /tmp/luci-indexcache
-	rm -rf /tmp/luci-modulecache/
-	exit 0
-}" > "$TEMP_PKG_DIR/CONTROL/postinst-pkg"
-chmod 0755 "$TEMP_PKG_DIR/CONTROL/postinst-pkg"
+if [ -z "$IPK_FILE" ]; then
+    echo "Error: IPK file not found!"
+    exit 1
+fi
 
-echo -e '#!/bin/sh
-[ -s ${IPKG_INSTROOT}/lib/functions.sh ] || exit 0
-. ${IPKG_INSTROOT}/lib/functions.sh
-default_prerm $0 $@' > "$TEMP_PKG_DIR/CONTROL/prerm"
-chmod 0755 "$TEMP_PKG_DIR/CONTROL/prerm"
+# Копирование пакета в корневую директорию
+cp "$IPK_FILE" ../../
+cd ..
 
-curl -fsSL "https://raw.githubusercontent.com/openwrt/openwrt/master/scripts/ipkg-build" -o "$TEMP_DIR/ipkg-build"
-chmod 0755 "$TEMP_DIR/ipkg-build"
-"$TEMP_DIR/ipkg-build" -m "" "$TEMP_PKG_DIR" "$TEMP_DIR"
-
-mv "$TEMP_DIR/${PKG_NAME}_${PKG_VERSION}_all.ipk" "$BASE_DIR/${PKG_NAME}_${PKG_VERSION}_all.ipk"
-rm -rf "$TEMP_DIR"
+echo "=== Build completed successfully ==="
+echo "IPK file: $(basename $IPK_FILE)"
