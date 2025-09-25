@@ -1,86 +1,99 @@
 #!/bin/bash
-set -e
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Copyright (C) 2023 Tianling Shen <cnsztl@immortalwrt.org>
+# Modified for aarch64_cortex-a53 build
 
-echo "=== Building Homeproxy for OpenWrt ==="
+set -o errexit
+set -o pipefail
 
-# Параметры сборки
+export PKG_SOURCE_DATE_EPOCH="$(date "+%s")"
+
+BASE_DIR="$(cd "$(dirname $0)"; pwd)"
+PKG_DIR="$BASE_DIR/.."
+
+# Параметры для вашей архитектуры
 TARGET="ipq60xx"
 SUBTARGET="generic"
 ARCH="aarch64_cortex-a53"
-OPENWRT_VERSION="23.05"
-IMMORTALWRT_REPO="https://github.com/immortalwrt/immortalwrt"
 IMMORTALWRT_BRANCH="openwrt-23.05"
 
-# Установка зависимостей
-echo "Installing dependencies..."
-sudo apt-get update
-sudo apt-get install -y \
-    build-essential ccache ecj fastjar file g++ gawk \
-    gettext git libelf-dev libncurses5-dev libncursesw5-dev \
-    libssl-dev python3 python3-distutils python3-setuptools \
-    rsync subversion swig time unzip wget xsltproc zlib1g-dev fakeroot
+function get_mk_value() {
+    awk -F "$1:=" '{print $2}' "$PKG_DIR/Makefile" | xargs
+}
 
-# Клонирование ImmortalWrt
-echo "Cloning ImmortalWrt..."
-if [ ! -d "immortalwrt" ]; then
-    git clone --depth 1 --branch "$IMMORTALWRT_BRANCH" "$IMMORTALWRT_REPO" immortalwrt
-else
-    echo "ImmortalWrt already exists, updating..."
+PKG_NAME="$(get_mk_value "PKG_NAME")"
+
+# Установка зависимостей для сборки
+install_build_deps() {
+    echo "Installing build dependencies..."
+    sudo apt-get update
+    sudo apt-get install -y \
+        build-essential ccache ecj fastjar file g++ gawk \
+        gettext git libelf-dev libncurses5-dev libncursesw5-dev \
+        libssl-dev python3 python3-distutils python3-setuptools \
+        rsync subversion swig time unzip wget xsltproc zlib1g-dev fakeroot
+}
+
+# Подготовка ImmortalWrt build system
+setup_build_env() {
+    echo "Setting up ImmortalWrt build environment..."
+    
+    if [ ! -d "immortalwrt" ]; then
+        git clone --depth 1 --branch "$IMMORTALWRT_BRANCH" \
+            https://github.com/immortalwrt/immortalwrt.git immortalwrt
+    fi
+    
     cd immortalwrt
-    git pull
-    cd ..
-fi
-
-# Клонирование homeproxy package
-echo "Setting up homeproxy package..."
-mkdir -p immortalwrt/package/custom
-cd immortalwrt/package/custom
-
-if [ ! -d "homeproxy" ]; then
-    git clone https://github.com/immortalwrt/homeproxy.git
-else
-    echo "Homeproxy package exists, updating..."
-    cd homeproxy
-    git pull
-    cd ..
-fi
-
-cd ../../..
-
-# Настройка конфигурации
-echo "Configuring build..."
-cd immortalwrt
-
-# Базовая конфигурация
-cat > .config << EOF
+    
+    # Копируем пакет homeproxy в дерево сборки
+    mkdir -p package/custom
+    cp -r "$PKG_DIR" package/custom/homeproxy
+    
+    # Базовая конфигурация
+    cat > .config << EOF
 CONFIG_TARGET_${TARGET}=y
 CONFIG_TARGET_${TARGET}_${SUBTARGET}=y
 CONFIG_TARGET_${TARGET}_${SUBTARGET}_DEVICE_generic=y
-CONFIG_PACKAGE_homeproxy=y
+CONFIG_PACKAGE_${PKG_NAME}=y
 CONFIG_PACKAGE_luci-app-homeproxy=y
 CONFIG_PACKAGE_sing-box=y
 EOF
+}
 
-# Обновление feeds
-echo "Updating feeds..."
-./scripts/feeds update -a
-./scripts/feeds install -a
+# Сборка через OpenWrt build system
+build_with_openwrt() {
+    echo "Building with OpenWrt build system..."
+    
+    ./scripts/feeds update -a
+    ./scripts/feeds install -a
+    
+    # Конфигурируем сборку
+    make defconfig
+    
+    # Собираем только нужный пакет
+    echo "Building package: $PKG_NAME"
+    make package/custom/homeproxy/compile -j$(nproc) V=s
+    
+    # Ищем собранный IPK файл
+    IPK_FILE=$(find bin/packages/${ARCH}/base -name "${PKG_NAME}*.ipk" | head -1)
+    
+    if [ -z "$IPK_FILE" ]; then
+        echo "Error: IPK file not found!"
+        exit 1
+    fi
+    
+    # Копируем результат
+    cp "$IPK_FILE" "$BASE_DIR/"
+    echo "BUILT_IPK=$(basename $IPK_FILE)" >> $GITHUB_ENV
+    echo "Successfully built: $(basename $IPK_FILE)"
+}
 
-# Сборка пакета
-echo "Building homeproxy package..."
-make package/homeproxy/compile -j$(ncp u) V=s
+# Основная функция
+main() {
+    install_build_deps
+    setup_build_env
+    build_with_openwrt
+}
 
-# Поиск собранного пакета
-IPK_FILE=$(find bin/packages/${ARCH}/base -name "homeproxy*.ipk" | head -1)
-
-if [ -z "$IPK_FILE" ]; then
-    echo "Error: IPK file not found!"
-    exit 1
-fi
-
-# Копирование пакета в корневую директорию
-cp "$IPK_FILE" ../../
-cd ..
-
-echo "=== Build completed successfully ==="
-echo "IPK file: $(basename $IPK_FILE)"
+main "$@"
